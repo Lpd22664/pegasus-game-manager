@@ -14,7 +14,7 @@ from typing import Any
 from .core import ARTWORK_DIR, HOME, normalise_record, slugify
 
 
-USER_AGENT = "PegasusGameManager/0.2 (+local Pegasus metadata manager)"
+USER_AGENT = "PegasusGameManager/0.3 (+local Pegasus metadata manager)"
 STORE_SEARCH_URL = "https://store.steampowered.com/api/storesearch/"
 STORE_DETAILS_URL = "https://store.steampowered.com/api/appdetails"
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
@@ -81,6 +81,55 @@ def choose_steam_match(query: str, items: list[dict[str, Any]]) -> dict[str, Any
     result = dict(best)
     result["match_score"] = round(best_score, 3)
     return result
+
+
+def search_steam_games(title: str, limit: int = 20) -> list[dict[str, Any]]:
+    """Return Steam Store candidates for an explicit user choice.
+
+    Unlike automatic matching, this intentionally does not reject ambiguous or
+    low-scoring results. The caller presents them to the user instead.
+    """
+
+    title = title.strip()
+    if not title or limit <= 0:
+        return []
+
+    query = urllib.parse.urlencode({"term": title, "cc": "GB", "l": "english"})
+    payload = _read_json(f"{STORE_SEARCH_URL}?{query}")
+    if not isinstance(payload, dict) or not isinstance(payload.get("items", []), list):
+        return []
+
+    candidates: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    for item in payload.get("items", []):
+        if not isinstance(item, dict) or item.get("type") not in {None, "app"}:
+            continue
+        try:
+            app_id = int(item.get("id"))
+        except (TypeError, ValueError):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name or app_id <= 0 or app_id in seen_ids:
+            continue
+
+        platforms = item.get("platforms") if isinstance(item.get("platforms"), dict) else {}
+        candidates.append(
+            {
+                "app_id": app_id,
+                "name": name,
+                "image_url": str(item.get("tiny_image") or ""),
+                "platforms": [
+                    platform.title()
+                    for platform in ("windows", "mac", "linux")
+                    if platforms.get(platform)
+                ],
+                "match_score": round(title_match_score(title, name), 3),
+            }
+        )
+        seen_ids.add(app_id)
+        if len(candidates) >= limit:
+            break
+    return candidates
 
 
 def _read_json(url: str, timeout: float = 12.0) -> Any:
@@ -185,6 +234,8 @@ def enrich_game_record(record: dict[str, Any], hints: dict[str, Any] | None = No
 
     hints = hints or {}
     enriched = normalise_record(copy.deepcopy(record))
+    replace_artwork = bool(hints.get("replace_artwork"))
+    manual_selection = bool(hints.get("manual_selection"))
     title_id = str(hints.get("rpcs3_title_id") or enriched["extras"].get("x-pegasus-rpcs3-title-id", ""))
     local_cover, local_background = _local_rpcs3_artwork(title_id)
     if not enriched["artwork_box_front"] and local_cover:
@@ -218,13 +269,22 @@ def enrich_game_record(record: dict[str, Any], hints: dict[str, Any] | None = No
     if match is None:
         if enriched["artwork_box_front"] or enriched["artwork_background"]:
             status = "Using artwork supplied by the game or emulator."
+        elif manual_selection:
+            status = "The selected Steam game is unavailable; no artwork was changed."
         else:
-            status = "No confident artwork match found; review this game after importing."
+            status = "No confident artwork match found; use Search manually to choose the game."
         return {"record": normalise_record(enriched), "status": status, "matched_title": ""}
 
     app_id = int(match["app_id"])
     art_root = ARTWORK_DIR / f"{slugify(enriched['title'])}-{app_id}"
     errors: list[str] = []
+    original_cover = enriched["artwork_box_front"]
+    original_background = enriched["artwork_background"]
+    if replace_artwork:
+        enriched["artwork_box_front"] = ""
+        enriched["artwork_background"] = ""
+    cover_downloaded = False
+    background_downloaded = False
     if not enriched["artwork_box_front"]:
         cover_urls = [
             f"https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/{app_id}/library_600x900_2x.jpg",
@@ -236,6 +296,7 @@ def enrich_game_record(record: dict[str, Any], hints: dict[str, Any] | None = No
                 continue
             try:
                 enriched["artwork_box_front"] = str(download_image(url, art_root / "box_front"))
+                cover_downloaded = True
                 break
             except (OSError, ValueError) as exc:
                 errors.append(str(exc))
@@ -244,18 +305,32 @@ def enrich_game_record(record: dict[str, Any], hints: dict[str, Any] | None = No
             enriched["artwork_background"] = str(
                 download_image(str(match["background_url"]), art_root / "background")
             )
+            background_downloaded = True
         except (OSError, ValueError) as exc:
             errors.append(str(exc))
+
+    # A failed replacement should not discard artwork the user already had.
+    if replace_artwork and not enriched["artwork_box_front"]:
+        enriched["artwork_box_front"] = original_cover
+    if replace_artwork and not enriched["artwork_background"]:
+        enriched["artwork_background"] = original_background
 
     if not enriched["summary"]:
         enriched["summary"] = str(match.get("summary") or "")
     if not enriched["genres"]:
         enriched["genres"] = list(match.get("genres") or [])
+    enriched["extras"]["x-pegasus-steam-app-id"] = str(app_id)
     enriched["extras"]["x-pegasus-artwork-source"] = f"Steam Store app {app_id}"
     enriched["extras"]["x-pegasus-artwork-match"] = str(match["name"])
 
+    downloaded = cover_downloaded or background_downloaded
     found = bool(enriched["artwork_box_front"] or enriched["artwork_background"])
-    status = f"Matched {match['name']} and downloaded artwork." if found else f"Matched {match['name']}, but its artwork could not be downloaded."
+    if downloaded:
+        status = f"Matched {match['name']} and downloaded artwork."
+    elif found:
+        status = f"Matched {match['name']}; existing artwork was kept because no new image could be downloaded."
+    else:
+        status = f"Matched {match['name']}, but its artwork could not be downloaded."
     return {
         "record": normalise_record(enriched),
         "status": status,

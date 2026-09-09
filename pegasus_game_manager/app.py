@@ -4,7 +4,7 @@ import copy
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import gi
 
@@ -28,7 +28,7 @@ from .core import (
     validate_record,
     write_pegasus_files,
 )
-from .artwork import enrich_game_record
+from .artwork import enrich_game_record, search_steam_games
 from .desktop import desktop_candidate, discover_desktop_games, xdg_desktop_dir
 
 
@@ -50,6 +50,8 @@ class GameManagerWindow(Gtk.ApplicationWindow):
         self._auto_scan_complete = False
         self._discovery_dialog: Gtk.Dialog | None = None
         self._discovery_state: dict[str, Any] | None = None
+        self._manual_search_dialog: Gtk.Dialog | None = None
+        self._manual_search_state: dict[str, Any] | None = None
         self._executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="pegasus-artwork")
 
         if not CATALOG_PATH.exists():
@@ -217,6 +219,12 @@ class GameManagerWindow(Gtk.ApplicationWindow):
         self.find_artwork_button.set_tooltip_text("Identify this title and download cover and background artwork")
         self.find_artwork_button.connect("clicked", lambda _button: self._find_artwork_for_form())
         artwork_heading.append(self.find_artwork_button)
+        self.search_artwork_button = Gtk.Button(label="Search manually…")
+        self.search_artwork_button.set_tooltip_text(
+            "Search Steam and choose the exact game when automatic matching cannot identify it"
+        )
+        self.search_artwork_button.connect("clicked", lambda _button: self._show_manual_artwork_search())
+        artwork_heading.append(self.search_artwork_button)
         form.append(artwork_heading)
 
         self.artwork_preview = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
@@ -582,8 +590,7 @@ class GameManagerWindow(Gtk.ApplicationWindow):
             if candidate:
                 hints = candidate
         fingerprint = (record["title"], record["files"][0] if record["files"] else "")
-        self.find_artwork_button.set_sensitive(False)
-        self.find_artwork_button.set_label("Finding…")
+        self._set_artwork_actions_busy(True, "Finding…")
         self._set_status(f"Identifying {record['title']} and looking for artwork…")
         future = self._executor.submit(enrich_game_record, record, hints)
         future.add_done_callback(
@@ -593,8 +600,7 @@ class GameManagerWindow(Gtk.ApplicationWindow):
     def _finish_form_artwork(self, future: Future, fingerprint: tuple[str, str]) -> bool:
         if self._closing:
             return False
-        self.find_artwork_button.set_sensitive(True)
-        self.find_artwork_button.set_label("Find artwork")
+        self._set_artwork_actions_busy(False)
         current_file = normalise_path(self.file_entry.get_text())
         if (self.title_entry.get_text().strip(), current_file) != fingerprint:
             self._set_status("Artwork lookup finished, but the form changed, so its result was not applied.")
@@ -616,6 +622,261 @@ class GameManagerWindow(Gtk.ApplicationWindow):
         self._refresh_artwork_preview()
         self._on_form_changed()
         self._set_status(result["status"])
+        return False
+
+    def _set_artwork_actions_busy(self, busy: bool, busy_label: str = "Finding…") -> None:
+        self.find_artwork_button.set_sensitive(not busy)
+        self.find_artwork_button.set_label(busy_label if busy else "Find artwork")
+        self.search_artwork_button.set_sensitive(not busy)
+
+    def _show_manual_artwork_search(
+        self,
+        record: dict[str, Any] | None = None,
+        on_apply_started: Callable[[dict[str, Any]], None] | None = None,
+        on_applied: Callable[[dict[str, Any]], None] | None = None,
+        transient_for: Gtk.Window | None = None,
+    ) -> None:
+        record = normalise_record(copy.deepcopy(record)) if record is not None else self._collect_form()
+        if not record["title"]:
+            self._show_error("A title is needed", "Enter a game title before searching for artwork.")
+            return
+        if self._manual_search_dialog is not None:
+            self._manual_search_dialog.present()
+            return
+
+        dialog = Gtk.Dialog(
+            title="Search for game artwork",
+            transient_for=transient_for or self,
+            modal=True,
+        )
+        dialog.set_default_size(720, 520)
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        apply_button = dialog.add_button("Use selected artwork", Gtk.ResponseType.ACCEPT)
+        apply_button.add_css_class("suggested-action")
+        apply_button.set_sensitive(False)
+
+        content = dialog.get_content_area()
+        content.set_spacing(12)
+        content.set_margin_top(18)
+        content.set_margin_bottom(18)
+        content.set_margin_start(18)
+        content.set_margin_end(18)
+        intro = Gtk.Label(
+            label=(
+                "Search the Steam Store and choose the exact game. The selected game's cover, "
+                "background, summary, and genres will be downloaded where available."
+            ),
+            xalign=0,
+            wrap=True,
+        )
+        content.append(intro)
+
+        search_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        search_entry = Gtk.SearchEntry()
+        search_entry.set_hexpand(True)
+        search_entry.set_text(record["title"])
+        search_entry.set_placeholder_text("Search by game title")
+        search_button = Gtk.Button(label="Search")
+        search_row.append(search_entry)
+        search_row.append(search_button)
+        content.append(search_row)
+
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_vexpand(True)
+        results_list = Gtk.ListBox()
+        results_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        results_list.set_activate_on_single_click(False)
+        scroller.set_child(results_list)
+        content.append(scroller)
+
+        progress_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        spinner = Gtk.Spinner()
+        progress_row.append(spinner)
+        search_status = Gtk.Label(xalign=0, wrap=True)
+        search_status.set_hexpand(True)
+        progress_row.append(search_status)
+        content.append(progress_row)
+
+        state: dict[str, Any] = {
+            "closed": False,
+            "request_id": 0,
+            "results": [],
+            "entry": search_entry,
+            "search_button": search_button,
+            "apply_button": apply_button,
+            "results_list": results_list,
+            "spinner": spinner,
+            "status": search_status,
+            "record": record,
+            "on_apply_started": on_apply_started,
+            "on_applied": on_applied,
+        }
+        search_button.connect("clicked", lambda _button: self._begin_manual_artwork_search(state))
+        search_entry.connect("activate", lambda _entry: self._begin_manual_artwork_search(state))
+        results_list.connect("row-selected", self._manual_result_selected, state)
+        results_list.connect(
+            "row-activated", lambda _list, _row: dialog.response(Gtk.ResponseType.ACCEPT)
+        )
+        dialog.connect("response", self._manual_search_response, state)
+        self._manual_search_dialog = dialog
+        self._manual_search_state = state
+        dialog.present()
+        self._begin_manual_artwork_search(state)
+
+    @staticmethod
+    def _clear_list_box(list_box: Gtk.ListBox) -> None:
+        child = list_box.get_first_child()
+        while child is not None:
+            next_child = child.get_next_sibling()
+            list_box.remove(child)
+            child = next_child
+
+    def _begin_manual_artwork_search(self, state: dict[str, Any]) -> None:
+        if state["closed"]:
+            return
+        query = state["entry"].get_text().strip()
+        if not query:
+            state["status"].set_text("Enter a game title to search.")
+            return
+
+        state["request_id"] += 1
+        request_id = state["request_id"]
+        state["results"] = []
+        self._clear_list_box(state["results_list"])
+        state["entry"].set_sensitive(False)
+        state["search_button"].set_sensitive(False)
+        state["apply_button"].set_sensitive(False)
+        state["spinner"].start()
+        state["spinner"].set_visible(True)
+        state["status"].set_text(f"Searching Steam for {query}…")
+        future = self._executor.submit(search_steam_games, query)
+        future.add_done_callback(
+            lambda completed: GLib.idle_add(
+                self._finish_manual_artwork_search, completed, state, request_id, query
+            )
+        )
+
+    def _finish_manual_artwork_search(
+        self,
+        future: Future,
+        state: dict[str, Any],
+        request_id: int,
+        query: str,
+    ) -> bool:
+        if self._closing or state["closed"] or request_id != state["request_id"]:
+            return False
+        state["entry"].set_sensitive(True)
+        state["search_button"].set_sensitive(True)
+        state["spinner"].stop()
+        state["spinner"].set_visible(False)
+        try:
+            results = future.result()
+        except Exception as exc:  # Keep provider/network failures inside the dialog.
+            state["status"].set_text(f"Steam search is unavailable: {exc}")
+            state["entry"].grab_focus()
+            return False
+
+        state["results"] = results
+        for result in results:
+            row = Gtk.ListBoxRow()
+            labels = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+            labels.set_margin_top(9)
+            labels.set_margin_bottom(9)
+            labels.set_margin_start(12)
+            labels.set_margin_end(12)
+            name = Gtk.Label(label=result["name"], xalign=0)
+            name.add_css_class("heading")
+            labels.append(name)
+            platforms = ", ".join(result["platforms"]) or "platform not listed"
+            detail = Gtk.Label(label=f"Steam app {result['app_id']}  ·  {platforms}", xalign=0)
+            detail.add_css_class("dim-label")
+            labels.append(detail)
+            row.set_child(labels)
+            row.set_selectable(True)
+            row.set_activatable(True)
+            state["results_list"].append(row)
+
+        if results:
+            state["status"].set_text(
+                f"Found {len(results)} result{'s' if len(results) != 1 else ''} for {query}. Select the exact game."
+            )
+        else:
+            state["status"].set_text("No Steam games found. Try a broader or different title.")
+            state["entry"].grab_focus()
+        return False
+
+    @staticmethod
+    def _manual_result_selected(
+        _list: Gtk.ListBox,
+        row: Gtk.ListBoxRow | None,
+        state: dict[str, Any],
+    ) -> None:
+        state["apply_button"].set_sensitive(row is not None and not state["closed"])
+
+    def _manual_search_response(
+        self,
+        dialog: Gtk.Dialog,
+        response: int,
+        state: dict[str, Any],
+    ) -> None:
+        selected: dict[str, Any] | None = None
+        row = state["results_list"].get_selected_row()
+        if response == Gtk.ResponseType.ACCEPT and row is not None:
+            index = row.get_index()
+            if 0 <= index < len(state["results"]):
+                selected = state["results"][index]
+
+        state["closed"] = True
+        self._manual_search_dialog = None
+        self._manual_search_state = None
+        dialog.destroy()
+        if selected is None:
+            return
+
+        record = normalise_record(copy.deepcopy(state["record"]))
+        fingerprint = (record["title"], record["files"][0] if record["files"] else "")
+        hints = {
+            "steam_app_id": selected["app_id"],
+            "manual_selection": True,
+            "replace_artwork": True,
+        }
+        if state["on_apply_started"] is not None:
+            state["on_apply_started"](selected)
+        else:
+            self._set_artwork_actions_busy(True, "Downloading…")
+            self._set_status(f"Downloading artwork for the selected game, {selected['name']}…")
+        future = self._executor.submit(enrich_game_record, record, hints)
+        if state["on_applied"] is not None:
+            future.add_done_callback(
+                lambda completed: GLib.idle_add(
+                    self._finish_manual_target_artwork,
+                    completed,
+                    record,
+                    state["on_applied"],
+                )
+            )
+        else:
+            future.add_done_callback(
+                lambda completed: GLib.idle_add(self._finish_form_artwork, completed, fingerprint)
+            )
+
+    def _finish_manual_target_artwork(
+        self,
+        future: Future,
+        fallback_record: dict[str, Any],
+        on_applied: Callable[[dict[str, Any]], None],
+    ) -> bool:
+        if self._closing:
+            return False
+        try:
+            result = future.result()
+        except Exception as exc:
+            result = {
+                "record": fallback_record,
+                "status": "Artwork lookup failed; this game can still be added.",
+                "error": str(exc),
+            }
+        on_applied(result)
         return False
 
     def _scan_desktop_on_startup(self) -> bool:
@@ -728,6 +989,10 @@ class GameManagerWindow(Gtk.ApplicationWindow):
             labels.append(source)
             lookup_status = Gtk.Label(label="Identifying game and finding artwork…", xalign=0, wrap=True)
             labels.append(lookup_status)
+            manual_search = Gtk.Button(label="Search manually…")
+            manual_search.set_halign(Gtk.Align.START)
+            manual_search.set_visible(False)
+            labels.append(manual_search)
             row.append(labels)
 
             spinner = Gtk.Spinner()
@@ -742,10 +1007,17 @@ class GameManagerWindow(Gtk.ApplicationWindow):
                 "check": check,
                 "status": lookup_status,
                 "spinner": spinner,
+                "manual_search": manual_search,
                 "result": None,
             }
             state["rows"].append(row_state)
             check.connect("toggled", lambda _check, current=state: self._update_discovery_add_button(current))
+            manual_search.connect(
+                "clicked",
+                lambda _button, current=row_state, shared=state: self._search_discovery_artwork(
+                    current, shared
+                ),
+            )
             future = self._executor.submit(enrich_game_record, candidate["record"], candidate)
             future.add_done_callback(
                 lambda completed, current=row_state, shared=state: GLib.idle_add(
@@ -778,9 +1050,60 @@ class GameManagerWindow(Gtk.ApplicationWindow):
         row_state["spinner"].stop()
         row_state["spinner"].set_visible(False)
         row_state["status"].set_text(result["status"])
+        row_state["manual_search"].set_visible(not bool(result.get("matched_title")))
         state["remaining"] -= 1
         self._update_discovery_add_button(state)
         return False
+
+    def _search_discovery_artwork(
+        self,
+        row_state: dict[str, Any],
+        state: dict[str, Any],
+    ) -> None:
+        if state["closed"] or row_state["result"] is None:
+            return
+        self._show_manual_artwork_search(
+            record=row_state["result"]["record"],
+            on_apply_started=lambda selected: self._manual_discovery_artwork_started(
+                selected, row_state, state
+            ),
+            on_applied=lambda result: self._manual_discovery_artwork_finished(
+                result, row_state, state
+            ),
+            transient_for=self._discovery_dialog,
+        )
+
+    def _manual_discovery_artwork_started(
+        self,
+        selected: dict[str, Any],
+        row_state: dict[str, Any],
+        state: dict[str, Any],
+    ) -> None:
+        if state["closed"]:
+            return
+        state["remaining"] += 1
+        row_state["manual_search"].set_sensitive(False)
+        row_state["spinner"].set_visible(True)
+        row_state["spinner"].start()
+        row_state["status"].set_text(f"Downloading artwork for {selected['name']}…")
+        self._update_discovery_add_button(state)
+
+    def _manual_discovery_artwork_finished(
+        self,
+        result: dict[str, Any],
+        row_state: dict[str, Any],
+        state: dict[str, Any],
+    ) -> None:
+        if state["closed"]:
+            return
+        row_state["result"] = result
+        row_state["manual_search"].set_sensitive(True)
+        row_state["manual_search"].set_visible(not bool(result.get("matched_title")))
+        row_state["spinner"].stop()
+        row_state["spinner"].set_visible(False)
+        row_state["status"].set_text(result["status"])
+        state["remaining"] = max(0, state["remaining"] - 1)
+        self._update_discovery_add_button(state)
 
     @staticmethod
     def _update_discovery_add_button(state: dict[str, Any]) -> None:
@@ -875,6 +1198,12 @@ class GameManagerWindow(Gtk.ApplicationWindow):
 
     def _on_close_request(self, _window: Gtk.Window) -> bool:
         self._closing = True
+        if self._manual_search_state is not None:
+            self._manual_search_state["closed"] = True
+            self._manual_search_state = None
+        if self._manual_search_dialog is not None:
+            self._manual_search_dialog.destroy()
+            self._manual_search_dialog = None
         if self._discovery_state is not None:
             self._discovery_state["closed"] = True
             self._discovery_state = None

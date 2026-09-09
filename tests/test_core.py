@@ -21,8 +21,8 @@ class MetadataTests(unittest.TestCase):
 shortname: rpcs3
 
 game: inFAMOUS
-file: /home/acm/Desktop/inFamous.desktop
-launch: /home/acm/.local/bin/rpcs3-launch-infamous
+file: /home/example/Desktop/inFamous.desktop
+launch: /home/example/.local/bin/rpcs3-launch-infamous
 tag: Local
 tag: RPCS3
 assets.box_front: /tmp/front.png
@@ -37,7 +37,7 @@ assets.background: /tmp/background.png
             self.assertEqual(record["title"], "inFAMOUS")
             self.assertEqual(record["tags"], ["Local", "RPCS3"])
             self.assertEqual(record["artwork_box_front"], "/tmp/front.png")
-            self.assertEqual(record["launch"], "/home/acm/.local/bin/rpcs3-launch-infamous")
+            self.assertEqual(record["launch"], "/home/example/.local/bin/rpcs3-launch-infamous")
             rendered = render_metadata(parsed["entries"], parsed["collections"])
             self.assertIn("tag: RPCS3", rendered)
             self.assertIn("assets.background: /tmp/background.png", rendered)
